@@ -202,8 +202,18 @@ func main() {
 	fmt.Println("\n正在停止录音...")
 	device.Stop()
 
+	// 创建 output 目录（如果不存在）
+	outputDir := "output"
+	if _, err := os.Stat(outputDir); os.IsNotExist(err) {
+		err = os.MkdirAll(outputDir, 0755)
+		if err != nil {
+			log.Fatal("创建 output 目录失败:", err)
+		}
+		fmt.Printf("✓ 创建目录: %s\n", outputDir)
+	}
+
 	// 生成文件名
-	filename := fmt.Sprintf("recording_%s.wav", time.Now().Format("20060102_150405"))
+	filename := fmt.Sprintf("%s/recording_%s.wav", outputDir, time.Now().Format("20060102_150405"))
 
 	// 保存为 WAV 文件
 	fmt.Printf("保存录音到文件: %s\n", filename)

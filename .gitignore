@@ -1,8 +1,9 @@
 # 编译后的可执行文件
 voice-recorder
 
-# 录音文件
+# 录音文件和输出目录
 *.wav
+output/
 
 # Go 相关
 *.exe
