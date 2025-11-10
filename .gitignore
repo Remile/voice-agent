@@ -1,0 +1,28 @@
+# 编译后的可执行文件
+voice-recorder
+
+# 录音文件
+*.wav
+
+# Go 相关
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# 测试文件
+*.test
+*.out
+
+# Go workspace 文件
+go.work
+
+# IDE 相关
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
