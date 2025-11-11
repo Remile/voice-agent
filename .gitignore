@@ -1,5 +1,6 @@
 # 编译后的可执行文件
 voice-recorder
+voice-agent
 
 # 录音文件和输出目录
 *.wav
@@ -26,4 +27,7 @@ go.work
 *.swo
 *~
 .DS_Store
+
+# 环境变量配置
+.env
 
