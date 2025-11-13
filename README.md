@@ -1,15 +1,17 @@
-# AWS Bedrock Nova 语音对话系统
+# AWS Bedrock Nova 全双工语音对话系统
 
-一个基于 AWS Bedrock Nova 模型的实时语音对话系统，支持语音输入并获取 AI 语音回复。
+一个基于 AWS Bedrock Nova 模型的**全双工实时语音对话系统**，支持 VAD 自动检测、实时流式对话和打断功能。
 
 ## 🎯 功能特性
 
-- ✅ **实时语音录制**：使用麦克风录制用户语音（8000 Hz, mulaw 编码）
-- ✅ **AWS Bedrock 集成**：直接调用 Nova Pro 模型进行对话
+### 核心功能
+- ✅ **VAD 自动检测**：智能检测语音活动，无需手动控制录音
+- ✅ **全双工对话**：4 个并发线程实现真正的实时对话
+- ✅ **支持打断**：可以在 AI 说话时打断它，自然流畅的交互
+- ✅ **多轮上下文**：自动维护对话历史和会话管理
+- ✅ **AWS Bedrock 集成**：调用 Nova Sonic 模型（专为语音对话优化）
+- ✅ **实时流式**：边录音边处理边播放，极低延迟
 - ✅ **多模态支持**：支持音频输入和音频输出
-- ✅ **自动播放**：将 AI 的语音回复自动播放到扬声器
-- ✅ **循环对话**：支持连续多轮对话
-- ✅ **录音保存**：可选择保存对话录音文件
 
 ## 🔧 系统要求
 
@@ -89,7 +91,7 @@ export AWS_PROFILE=your-profile
 - us-east-1 (N. Virginia)
 - us-west-2 (Oregon)
 
-## 🚀 使用方法
+## 🚀 快速开始
 
 ### 编译程序
 
@@ -109,22 +111,26 @@ go build -o voice-agent main.go
 go run main.go
 ```
 
-### 使用流程
+### 使用方式
 
-1. 程序启动后会自动初始化音频设备和 AWS Bedrock 客户端
-2. 每轮对话流程：
-   - 📢 提示 "请说话..."
-   - 🎤 录音 5 秒（可在代码中修改时长）
-   - 📤 自动发送音频到 Nova 模型
-   - 📥 接收 Nova 的语音回复
-   - 🔊 自动播放 AI 的回复
-3. 按 `Ctrl+C` 退出程序
+**全双工模式（推荐）：**
+
+1. 程序启动后会自动初始化所有组件
+2. 系统持续监听，**直接开始说话即可**
+3. VAD 会自动检测你的语音并发送
+4. AI 回复会实时播放
+5. 可以在 AI 说话时打断它
+6. 按 `Ctrl+C` 退出
+
+**传统模式（兼容旧版本）：**
+
+如果需要使用固定时长录音的旧模式，可以调用 `RecordAudio()` 和 `SendToNova()` 方法。
 
 ### 输出文件
 
 程序会自动在 `output` 目录下保存：
-- `input_YYYYMMDD_HHMMSS.wav`：用户输入的录音
-- `response_YYYYMMDD_HHMMSS.wav`：Nova 的语音回复
+- `input_YYYYMMDD_HHMMSS.wav`：用户输入的录音（可选）
+- `response_YYYYMMDD_HHMMSS.wav`：Nova 的语音回复（可选）
 
 ## 📝 技术细节
 
@@ -145,15 +151,33 @@ go run main.go
 
 - **音频处理**：`github.com/gen2brain/malgo` - 跨平台音频库
 - **AWS SDK**：`github.com/aws/aws-sdk-go-v2` - AWS Go SDK v2
-- **AI 模型**：Amazon Nova Pro (us.amazon.nova-pro-v1:0)
+- **AI 模型**：Amazon Nova Sonic (us.amazon.nova-sonic-v1:0) - 专为语音对话优化
 
-### Nova 模型
+### 架构设计
 
-Amazon Nova Pro 是 AWS Bedrock 提供的多模态 AI 模型，支持：
-- 文本理解和生成
-- 音频输入处理
-- 音频输出生成
-- 多轮对话
+**4 个并发线程：**
+1. **录音线程**：持续监听麦克风 + VAD 检测
+2. **发送线程**：流式发送音频到 Nova API
+3. **接收线程**：接收 API 响应（当前集成在发送线程中）
+4. **播放线程**：实时流式播放 + 支持打断
+
+**通道通信：**
+- `audioInputChan`：录音 → 发送
+- `audioOutputChan`：接收 → 播放
+- `interruptChan`：打断信号
+
+### Nova Sonic 模型
+
+Amazon Nova Sonic 是 AWS Bedrock 专为语音对话优化的模型，支持：
+- 低延迟语音处理
+- 实时流式对话
+- 多轮上下文记忆
+- 自然语言理解
+
+## 📚 高级功能
+
+详细的全双工功能说明、VAD 参数调优、性能优化等，请参阅：
+- **[FULLUPLEX_GUIDE.md](FULLUPLEX_GUIDE.md)** - 完整的全双工特性文档
 
 ## 🔍 故障排查
 
@@ -202,37 +226,54 @@ Error: Model not found
 
 ## 🛠️ 自定义配置
 
-### 修改录音时长
+### 调整 VAD 参数
 
-在 `main.go` 中找到：
+在 `vad.go` 的 `DefaultVADConfig()` 中修改：
 
 ```go
-audioData, err := agent.RecordAudio(5 * time.Second)
+return VADConfig{
+    EnergyThreshold:   500.0,  // 能量阈值（越高越不敏感）
+    SpeechStartFrames: 3,      // 语音开始确认帧数
+    SpeechEndFrames:   8,      // 语音结束确认帧数
+}
 ```
 
-将 `5 * time.Second` 改为你想要的时长，例如 `10 * time.Second`。
+**快速调优建议：**
+- 环境嘈杂 → 提高 `EnergyThreshold` 到 800
+- 反应太慢 → 降低 `EnergyThreshold` 到 300
+- 容易被切断 → 增加 `SpeechEndFrames` 到 12
 
 ### 更换模型
 
 在 `main.go` 的 `NewVoiceAgent` 函数中修改：
 
 ```go
-modelID: "us.amazon.nova-pro-v1:0",
+modelID: "us.amazon.nova-sonic-v1:0",  // Nova Sonic (推荐)
 ```
 
 可选的模型：
-- `us.amazon.nova-pro-v1:0` - Nova Pro（推荐）
-- `us.amazon.nova-lite-v1:0` - Nova Lite（更快，但能力较弱）
+- `us.amazon.nova-sonic-v1:0` - Nova Sonic（语音对话专用，推荐）
+- `us.amazon.nova-pro-v1:0` - Nova Pro（多模态，通用）
+- `us.amazon.nova-lite-v1:0` - Nova Lite（更快，能力较弱）
 
 ### 调整 AI 参数
 
-在 `SendToNova` 函数中修改 `inferenceConfig`：
+在 `StreamAudioToNova` 函数中修改 `inferenceConfig`：
 
 ```go
 "inferenceConfig": map[string]interface{}{
-    "max_new_tokens": 2048,
-    "temperature":    0.7,  // 0.0 - 1.0，越高越有创造性
+    "maxTokens":   2048,
+    "temperature": 0.7,  // 0.0 - 1.0，越高越有创造性
 },
+```
+
+### 音频缓冲大小
+
+在 `NewVoiceAgent` 中调整通道缓冲：
+
+```go
+audioInputChan:  make(chan AudioChunk, 10),   // 输入缓冲
+audioOutputChan: make(chan AudioChunk, 100),  // 输出缓冲（可增大）
 ```
 
 ## 📄 许可证

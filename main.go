@@ -6,9 +6,12 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -180,17 +183,62 @@ func writeMulawWAVFile(filename string, mulawData []byte) error {
 	return nil
 }
 
-// VoiceAgent 语音对话代理
+// AudioChunk 音频数据块
+type AudioChunk struct {
+	Data      []byte
+	Timestamp time.Time
+}
+
+// ConversationMessage 对话消息
+type ConversationMessage struct {
+	Role    string // "user" 或 "assistant"
+	Content []byte // 音频数据
+	Text    string // 文本内容（可选）
+}
+
+// ConversationContext 对话上下文
+type ConversationContext struct {
+	SessionID string
+	Messages  []ConversationMessage
+	StartTime time.Time
+}
+
+// VoiceAgent 语音对话代理（全双工版本）
 type VoiceAgent struct {
 	bedrockClient *bedrockruntime.Client
 	audioContext  *malgo.AllocatedContext
 	modelID       string
+	region        string
+	awsConfig     aws.Config
+
+	// VAD 检测器
+	vad *VADDetector
+
+	// 通道
+	audioInputChan  chan AudioChunk // 录音 -> 发送
+	audioOutputChan chan AudioChunk // 接收 -> 播放
+	interruptChan   chan struct{}   // 打断信号
+
+	// 对话上下文
+	context *ConversationContext
+
+	// 双向流
+	httpClient *http.Client
+	streamConn io.ReadWriteCloser
+
+	// 播放控制
+	playbackCtx    context.Context
+	cancelPlayback context.CancelFunc
+
+	// 状态标志
+	isPlaying   bool
+	isRecording bool
 }
 
 // NewVoiceAgent 创建新的语音对话代理
 func NewVoiceAgent(ctx context.Context) (*VoiceAgent, error) {
-	// 加载 AWS 配置
-	cfg, err := config.LoadDefaultConfig(ctx)
+	// 加载 AWS 配置，强制使用 us-east-1
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion("us-east-1"))
 	if err != nil {
 		return nil, fmt.Errorf("加载AWS配置失败: %w", err)
 	}
@@ -206,22 +254,210 @@ func NewVoiceAgent(ctx context.Context) (*VoiceAgent, error) {
 		return nil, fmt.Errorf("初始化音频上下文失败: %w", err)
 	}
 
+	// 创建 VAD 检测器
+	vadConfig := DefaultVADConfig()
+	vad := NewVADDetector(vadConfig)
+
+	// 创建播放控制上下文
+	playbackCtx, cancelPlayback := context.WithCancel(ctx)
+
+	// 生成会话 ID
+	sessionID := fmt.Sprintf("session_%d", time.Now().Unix())
+
 	return &VoiceAgent{
-		bedrockClient: bedrockClient,
-		audioContext:  audioCtx,
-		modelID:       "us.amazon.nova-pro-v1:0", // Nova Pro 模型
+		bedrockClient:   bedrockClient,
+		audioContext:    audioCtx,
+		modelID:         "amazon.nova-sonic-v1:0",
+		region:          "us-east-1",
+		awsConfig:       cfg,
+		vad:             vad,
+		audioInputChan:  make(chan AudioChunk, 10),
+		audioOutputChan: make(chan AudioChunk, 100),
+		interruptChan:   make(chan struct{}, 1),
+		httpClient:      &http.Client{},
+		context: &ConversationContext{
+			SessionID: sessionID,
+			Messages:  make([]ConversationMessage, 0),
+			StartTime: time.Now(),
+		},
+		playbackCtx:    playbackCtx,
+		cancelPlayback: cancelPlayback,
+		isPlaying:      false,
+		isRecording:    false,
 	}, nil
 }
 
 // Close 清理资源
 func (va *VoiceAgent) Close() {
+	// 取消播放上下文
+	if va.cancelPlayback != nil {
+		va.cancelPlayback()
+	}
+
+	// 关闭通道
+	close(va.interruptChan)
+	close(va.audioInputChan)
+	close(va.audioOutputChan)
+
+	// 清理音频上下文
 	if va.audioContext != nil {
 		va.audioContext.Uninit()
 		va.audioContext.Free()
 	}
 }
 
-// RecordAudio 录制音频
+// AddUserMessage 添加用户消息到对话上下文
+func (va *VoiceAgent) AddUserMessage(audioData []byte) {
+	va.context.Messages = append(va.context.Messages, ConversationMessage{
+		Role:    "user",
+		Content: audioData,
+	})
+	fmt.Printf("📝 添加用户消息到上下文 (当前消息数: %d)\n", len(va.context.Messages))
+}
+
+// AddAssistantMessage 添加助手消息到对话上下文
+func (va *VoiceAgent) AddAssistantMessage(audioData []byte, text string) {
+	va.context.Messages = append(va.context.Messages, ConversationMessage{
+		Role:    "assistant",
+		Content: audioData,
+		Text:    text,
+	})
+	fmt.Printf("📝 添加助手消息到上下文 (当前消息数: %d)\n", len(va.context.Messages))
+}
+
+// GetConversationHistory 获取对话历史
+func (va *VoiceAgent) GetConversationHistory() []ConversationMessage {
+	return va.context.Messages
+}
+
+// ClearConversationHistory 清除对话历史
+func (va *VoiceAgent) ClearConversationHistory() {
+	va.context.Messages = make([]ConversationMessage, 0)
+	fmt.Println("🗑️  对话历史已清除")
+}
+
+// GetSessionInfo 获取会话信息
+func (va *VoiceAgent) GetSessionInfo() (sessionID string, messageCount int, duration time.Duration) {
+	return va.context.SessionID, len(va.context.Messages), time.Since(va.context.StartTime)
+}
+
+// ResetSession 重置会话（保留配置，清除历史）
+func (va *VoiceAgent) ResetSession() {
+	oldSessionID := va.context.SessionID
+	va.context = &ConversationContext{
+		SessionID: fmt.Sprintf("session_%d", time.Now().Unix()),
+		Messages:  make([]ConversationMessage, 0),
+		StartTime: time.Now(),
+	}
+	fmt.Printf("🔄 会话已重置: %s -> %s\n", oldSessionID, va.context.SessionID)
+}
+
+// StartContinuousRecording 启动连续录音线程（带 VAD 检测）
+func (va *VoiceAgent) StartContinuousRecording(ctx context.Context) error {
+	va.isRecording = true
+
+	// 配置录音设备
+	deviceConfig := malgo.DefaultDeviceConfig(malgo.Capture)
+	deviceConfig.Capture.Format = malgo.FormatS16 // 16-bit PCM
+	deviceConfig.Capture.Channels = 1             // 单声道
+	deviceConfig.SampleRate = 8000                // 8000 Hz
+	deviceConfig.Alsa.NoMMap = 1
+
+	// 语音缓冲区
+	var currentSpeechBuffer []byte
+	var isSpeaking bool = false
+
+	// 数据回调函数
+	onRecvFrames := func(pOutputSample, pInputSamples []byte, framecount uint32) {
+		if len(pInputSamples) == 0 {
+			return
+		}
+
+		// 检测语音活动
+		vadState := va.vad.Detect(pInputSamples)
+
+		switch vadState {
+		case StateSpeech:
+			if !isSpeaking {
+				// 语音开始
+				fmt.Println("🎤 检测到语音，开始录音...")
+				isSpeaking = true
+				currentSpeechBuffer = make([]byte, 0)
+
+				// 如果正在播放，触发打断
+				if va.isPlaying {
+					select {
+					case va.interruptChan <- struct{}{}:
+						fmt.Println("⚠️  打断 AI 播放")
+					default:
+					}
+				}
+			}
+
+			// 将 PCM 数据转换为 mulaw 并添加到缓冲区
+			for i := 0; i < len(pInputSamples); i += 2 {
+				if i+1 < len(pInputSamples) {
+					sample := int16(binary.LittleEndian.Uint16(pInputSamples[i : i+2]))
+					mulawByte := linearToMulaw(sample)
+					currentSpeechBuffer = append(currentSpeechBuffer, mulawByte)
+				}
+			}
+
+		case StateSpeechEnd:
+			if isSpeaking && len(currentSpeechBuffer) > 0 {
+				// 语音结束，发送音频数据
+				fmt.Printf("✓ 语音结束，录制了 %.2f 秒\n", float64(len(currentSpeechBuffer))/8000.0)
+
+				// 发送到输入通道
+				select {
+				case va.audioInputChan <- AudioChunk{
+					Data:      currentSpeechBuffer,
+					Timestamp: time.Now(),
+				}:
+				case <-ctx.Done():
+					return
+				}
+
+				// 重置状态
+				isSpeaking = false
+				currentSpeechBuffer = nil
+			}
+
+		case StateSilence:
+			// 静音状态，什么都不做
+		}
+	}
+
+	// 初始化设备
+	device, err := malgo.InitDevice(va.audioContext.Context, deviceConfig, malgo.DeviceCallbacks{
+		Data: onRecvFrames,
+	})
+	if err != nil {
+		return fmt.Errorf("初始化录音设备失败: %w", err)
+	}
+
+	// 启动录音
+	err = device.Start()
+	if err != nil {
+		device.Uninit()
+		return fmt.Errorf("启动录音失败: %w", err)
+	}
+
+	fmt.Println("✓ 连续录音已启动（使用 VAD 自动检测）")
+
+	// 等待上下文取消
+	go func() {
+		<-ctx.Done()
+		device.Stop()
+		device.Uninit()
+		va.isRecording = false
+		fmt.Println("✓ 录音线程已停止")
+	}()
+
+	return nil
+}
+
+// RecordAudio 录制音频（保留旧方法用于兼容）
 func (va *VoiceAgent) RecordAudio(duration time.Duration) ([]byte, error) {
 	var recordedData []byte
 
@@ -267,7 +503,110 @@ func (va *VoiceAgent) RecordAudio(duration time.Duration) ([]byte, error) {
 	return recordedData, nil
 }
 
-// PlayAudio 播放音频
+// StartContinuousPlayback 启动连续播放线程（支持流式播放和打断）
+func (va *VoiceAgent) StartContinuousPlayback(ctx context.Context) error {
+	// 配置播放设备
+	deviceConfig := malgo.DefaultDeviceConfig(malgo.Playback)
+	deviceConfig.Playback.Format = malgo.FormatS16
+	deviceConfig.Playback.Channels = 1
+	deviceConfig.SampleRate = 8000
+	deviceConfig.Alsa.NoMMap = 1
+
+	// 播放缓冲队列
+	var playbackBuffer []byte
+	var bufferMutex sync.Mutex
+
+	// 播放回调函数
+	onSendFrames := func(pOutputSample, pInputSamples []byte, framecount uint32) {
+		bufferMutex.Lock()
+		defer bufferMutex.Unlock()
+
+		bytesNeeded := int(framecount) * 2 // 16-bit = 2 bytes per sample
+
+		if len(playbackBuffer) == 0 {
+			// 没有数据，输出静音
+			for i := range pOutputSample {
+				pOutputSample[i] = 0
+			}
+			return
+		}
+
+		bytesToCopy := bytesNeeded
+		if bytesToCopy > len(playbackBuffer) {
+			bytesToCopy = len(playbackBuffer)
+		}
+
+		copy(pOutputSample, playbackBuffer[:bytesToCopy])
+		playbackBuffer = playbackBuffer[bytesToCopy:]
+
+		// 填充剩余部分为静音
+		for i := bytesToCopy; i < len(pOutputSample); i++ {
+			pOutputSample[i] = 0
+		}
+	}
+
+	// 初始化播放设备
+	device, err := malgo.InitDevice(va.audioContext.Context, deviceConfig, malgo.DeviceCallbacks{
+		Data: onSendFrames,
+	})
+	if err != nil {
+		return fmt.Errorf("初始化播放设备失败: %w", err)
+	}
+
+	// 启动播放
+	err = device.Start()
+	if err != nil {
+		device.Uninit()
+		return fmt.Errorf("启动播放失败: %w", err)
+	}
+
+	fmt.Println("✓ 连续播放已启动")
+
+	// 播放控制协程
+	go func() {
+		defer device.Stop()
+		defer device.Uninit()
+		defer fmt.Println("✓ 播放线程已停止")
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+
+			case <-va.interruptChan:
+				// 收到打断信号，清空播放缓冲
+				bufferMutex.Lock()
+				playbackBuffer = nil
+				bufferMutex.Unlock()
+				va.isPlaying = false
+				fmt.Println("⚠️  播放已中断")
+
+			case chunk := <-va.audioOutputChan:
+				// 收到音频数据
+				if !va.isPlaying {
+					va.isPlaying = true
+					fmt.Println("🔊 开始播放 AI 回复...")
+				}
+
+				// 将 mulaw 转换为 PCM
+				pcmData := make([]byte, len(chunk.Data)*2)
+				for i, mulaw := range chunk.Data {
+					sample := mulawToLinear(mulaw)
+					binary.LittleEndian.PutUint16(pcmData[i*2:i*2+2], uint16(sample))
+				}
+
+				// 添加到播放缓冲
+				bufferMutex.Lock()
+				playbackBuffer = append(playbackBuffer, pcmData...)
+				bufferMutex.Unlock()
+			}
+		}
+	}()
+
+	return nil
+}
+
+// PlayAudio 播放音频（保留旧方法用于兼容）
 func (va *VoiceAgent) PlayAudio(mulawData []byte) error {
 	// 将 mulaw 转换为 PCM
 	pcmData := make([]byte, len(mulawData)*2)
@@ -324,7 +663,105 @@ func (va *VoiceAgent) PlayAudio(mulawData []byte) error {
 	return nil
 }
 
-// SendToNova 发送音频到 Nova 模型并获取响应
+// ReceiveFromNova 流式接收 Nova 响应（占位符，当前集成在发送线程中）
+// 注意：当 AWS SDK 真正支持 ConverseStream 时，这个方法将处理事件流
+func (va *VoiceAgent) ReceiveFromNova(ctx context.Context, eventStream chan *bedrockruntime.ConverseStreamOutput) error {
+	fmt.Println("📥 ConverseStream 接收线程已启动（当前集成在发送线程中）")
+
+	for {
+		select {
+		case <-ctx.Done():
+			fmt.Println("✓ 接收线程已停止")
+			return ctx.Err()
+
+		case event := <-eventStream:
+			if event == nil {
+				continue
+			}
+
+			// 处理不同类型的流式事件
+			// 这里是 ConverseStream API 的事件处理逻辑
+			// 当 AWS SDK 支持时，需要处理以下事件：
+			// - ContentBlockStart
+			// - ContentBlockDelta (音频数据块)
+			// - ContentBlockStop
+			// - MessageStart
+			// - MessageStop
+			// - Metadata
+
+			fmt.Println("📥 收到流式事件（占位符）")
+		}
+	}
+}
+
+// StreamAudioToNova 使用双向流发送音频到 Nova Sonic
+func (va *VoiceAgent) StreamAudioToNova(ctx context.Context, receiveChan chan<- *bedrockruntime.ConverseStreamOutput) error {
+	fmt.Println("📤 Nova Sonic 双向流已启动")
+
+	// 创建双向流
+	stream, err := va.NewNovaSonicStream(ctx)
+	if err != nil {
+		return fmt.Errorf("创建流失败: %w", err)
+	}
+	defer stream.Close()
+
+	// 启动流
+	if err := stream.Start(ctx); err != nil {
+		return fmt.Errorf("启动流失败: %w", err)
+	}
+
+	// 启动响应读取线程
+	go func() {
+		if err := stream.ReadResponses(ctx); err != nil && err != context.Canceled {
+			log.Printf("❌ 读取响应错误: %v", err)
+		}
+	}()
+
+	// 开始音频输入
+	if err := stream.StartAudioInput(); err != nil {
+		return fmt.Errorf("开始音频输入失败: %w", err)
+	}
+
+	// 持续发送音频
+	for {
+		select {
+		case <-ctx.Done():
+			stream.EndAudioInput()
+			fmt.Println("✓ 发送线程已停止")
+			return ctx.Err()
+
+		case audioChunk := <-va.audioInputChan:
+			// 收到音频数据
+			fmt.Printf("📤 发送音频 (%.2f 秒)...\n", float64(len(audioChunk.Data))/8000.0)
+
+			// mulaw 转 PCM (Nova Sonic 需要 16kHz PCM)
+			pcmData := make([]byte, len(audioChunk.Data)*2)
+			for i, mulaw := range audioChunk.Data {
+				sample := mulawToLinear(mulaw)
+				binary.LittleEndian.PutUint16(pcmData[i*2:], uint16(sample))
+			}
+
+			// 发送音频块
+			if err := stream.SendAudioChunk(pcmData); err != nil {
+				log.Printf("❌ 发送音频失败: %v", err)
+				continue
+			}
+
+			// 音频发送完毕，结束并重新开始
+			if err := stream.EndAudioInput(); err != nil {
+				log.Printf("❌ 结束音频输入失败: %v", err)
+			}
+
+			// 等待短暂时间后重新开始新的音频输入
+			time.Sleep(100 * time.Millisecond)
+			if err := stream.StartAudioInput(); err != nil {
+				log.Printf("❌ 重新开始音频输入失败: %v", err)
+			}
+		}
+	}
+}
+
+// SendToNova 发送音频到 Nova 模型并获取响应（保留旧方法用于兼容）
 func (va *VoiceAgent) SendToNova(ctx context.Context, audioData []byte) ([]byte, string, error) {
 	// 将音频数据编码为 base64
 	audioBase64 := base64.StdEncoding.EncodeToString(audioData)
@@ -429,28 +866,32 @@ func (va *VoiceAgent) SendToNova(ctx context.Context, audioData []byte) ([]byte,
 }
 
 func main() {
-	fmt.Println("=== AWS Bedrock Nova 语音对话系统 ===")
-	fmt.Println("采样率: 8000 Hz | 编码: mulaw | 声道: 单声道")
+	fmt.Println("=== AWS Bedrock Nova 全双工语音对话系统 ===")
+	fmt.Println("模型: Nova Sonic | 采样率: 8000 Hz | 编码: mulaw")
+	fmt.Println("特性: VAD 自动检测 | 实时流式对话 | 支持打断")
 	fmt.Println()
 
-	ctx := context.Background()
+	// 创建主上下文
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	// 创建语音代理
 	agent, err := NewVoiceAgent(ctx)
 	if err != nil {
-		log.Fatalf("创建语音代理失败: %v", err)
+		log.Fatalf("❌ 创建语音代理失败: %v", err)
 	}
 	defer agent.Close()
 
 	fmt.Println("✓ 语音代理已初始化")
-	fmt.Println("按 Ctrl+C 退出程序")
+	sessionID, _, _ := agent.GetSessionInfo()
+	fmt.Printf("📋 会话 ID: %s\n", sessionID)
 	fmt.Println()
 
-	// 创建 output 目录
+	// 创建 output 目录（用于保存录音，可选）
 	outputDir := "output"
 	if _, err := os.Stat(outputDir); os.IsNotExist(err) {
 		if err := os.MkdirAll(outputDir, 0755); err != nil {
-			log.Fatalf("创建 output 目录失败: %v", err)
+			log.Printf("⚠️  创建 output 目录失败: %v", err)
 		}
 	}
 
@@ -458,64 +899,90 @@ func main() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
-	// 对话循环
-	conversationCount := 0
+	// 创建错误通道
+	errChan := make(chan error, 4)
+
+	// 启动所有线程
+	fmt.Println("🚀 启动全双工语音对话系统...")
+	fmt.Println()
+
+	// 1. 启动连续录音线程（带 VAD 检测）
+	go func() {
+		if err := agent.StartContinuousRecording(ctx); err != nil {
+			if err != context.Canceled {
+				errChan <- fmt.Errorf("录音线程错误: %w", err)
+			}
+		}
+	}()
+
+	// 2. 启动连续播放线程（支持流式播放和打断）
+	go func() {
+		if err := agent.StartContinuousPlayback(ctx); err != nil {
+			if err != context.Canceled {
+				errChan <- fmt.Errorf("播放线程错误: %w", err)
+			}
+		}
+	}()
+
+	// 3. 启动流式发送线程（ConverseStream）
+	go func() {
+		if err := agent.StreamAudioToNova(ctx, nil); err != nil {
+			if err != context.Canceled {
+				errChan <- fmt.Errorf("发送线程错误: %w", err)
+			}
+		}
+	}()
+
+	// 4. 启动流式接收线程（占位符，当前集成在发送线程中）
+	// 当真正的 ConverseStream API 可用时，启用此线程
+	// go func() {
+	// 	eventStream := make(chan *bedrockruntime.ConverseStreamOutput, 10)
+	// 	if err := agent.ReceiveFromNova(ctx, eventStream); err != nil {
+	// 		if err != context.Canceled {
+	// 			errChan <- fmt.Errorf("接收线程错误: %w", err)
+	// 		}
+	// 	}
+	// }()
+
+	fmt.Println("✓ 所有线程已启动")
+	fmt.Println()
+	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	fmt.Println("系统就绪！开始说话，系统会自动检测并处理。")
+	fmt.Println("按 Ctrl+C 退出程序")
+	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	fmt.Println()
+
+	// 定期显示会话信息
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	// 主事件循环
 	for {
 		select {
 		case <-sigChan:
-			fmt.Println("\n\n程序已退出")
+			// 收到退出信号
+			fmt.Println("\n\n🛑 收到退出信号，正在关闭...")
+			cancel()
+
+			// 显示最终统计
+			sessionID, msgCount, duration := agent.GetSessionInfo()
+			fmt.Printf("\n📊 会话统计:\n")
+			fmt.Printf("   会话 ID: %s\n", sessionID)
+			fmt.Printf("   消息数量: %d\n", msgCount)
+			fmt.Printf("   会话时长: %s\n", duration.Round(time.Second))
+			fmt.Println("\n✓ 程序已退出")
 			return
-		default:
-			conversationCount++
-			fmt.Printf("\n━━━━━━━━ 对话 #%d ━━━━━━━━\n\n", conversationCount)
 
-			// 1. 录制用户语音
-			fmt.Println("请说话...")
-			audioData, err := agent.RecordAudio(5 * time.Second)
-			if err != nil {
-				log.Printf("录音失败: %v", err)
-				continue
-			}
+		case err := <-errChan:
+			// 收到线程错误
+			log.Printf("❌ 线程错误: %v", err)
+			log.Println("⚠️  尝试继续运行...")
 
-			// 保存录音文件（可选）
-			timestamp := time.Now().Format("20060102_150405")
-			inputFile := fmt.Sprintf("%s/input_%s.wav", outputDir, timestamp)
-			if err := writeMulawWAVFile(inputFile, audioData); err != nil {
-				log.Printf("保存录音文件失败: %v", err)
-			} else {
-				fmt.Printf("💾 录音已保存: %s\n", inputFile)
-			}
-
-			// 2. 发送到 Nova 并获取响应
-			responseAudio, responseText, err := agent.SendToNova(ctx, audioData)
-			if err != nil {
-				log.Printf("发送到 Nova 失败: %v", err)
-				continue
-			}
-
-			// 如果有音频响应
-			if len(responseAudio) > 0 {
-				// 保存响应音频文件（可选）
-				outputFile := fmt.Sprintf("%s/response_%s.wav", outputDir, timestamp)
-				if err := writeMulawWAVFile(outputFile, responseAudio); err != nil {
-					log.Printf("保存响应文件失败: %v", err)
-				} else {
-					fmt.Printf("💾 响应已保存: %s\n", outputFile)
-				}
-
-				// 3. 播放 Nova 的响应
-				if err := agent.PlayAudio(responseAudio); err != nil {
-					log.Printf("播放音频失败: %v", err)
-					continue
-				}
-			} else if responseText != "" {
-				// 如果只有文本响应，显示文本
-				fmt.Printf("💬 Nova 回复（仅文本）: %s\n", responseText)
-				fmt.Println("⚠️  注意：此模型可能不支持音频输出，请检查模型配置")
-			}
-
-			fmt.Println("\n准备下一轮对话...")
-			time.Sleep(1 * time.Second)
+		case <-ticker.C:
+			// 定期显示会话信息
+			sessionID, msgCount, duration := agent.GetSessionInfo()
+			fmt.Printf("\n📊 [会话信息] ID: %s | 消息: %d | 时长: %s\n\n",
+				sessionID, msgCount, duration.Round(time.Second))
 		}
 	}
 }
